@@ -1,5 +1,6 @@
 # Copyright © 2023-2024 Apple Inc.
 
+from abc import ABC, abstractmethod
 import argparse
 import contextlib
 import functools
@@ -283,57 +284,33 @@ def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_
                     group_size=kv_group_size, bits=kv_bits
                 )
 
+class SearchStrategy(ABC):
+    """
+    A strategy for obtaining a sequence of tokens from the model.
+    """
 
-def linear_search(
-    y: mx.array,
-    model: nn.Module,
-    max_tokens: int,
-    sampler: Callable[[mx.array], mx.array],
-    logits_processors: List[Callable[[mx.array, mx.array], mx.array]],
-    prompt_cache: List[Any],
-    prompt_progress_callback: Callable[[int, int], None],
-    total_prompt_tokens: int,
-    quantize_cache_fn: Callable[[Any], None]
+    @abstractmethod
+    def generate(
+        self,
+        y: mx.array,
+        prompt_cache: List[Any],
+        quantize_cache_fn: Callable[[Any], None],
+        total_prompt_tokens: int,
+    ) -> Generator[Tuple[mx.array, mx.array], None, None]:
+        """
+        Generates a sequence of tokens from the model.
 
-)-> Generator[Tuple[mx.array, mx.array], None, None]:
-    tokens = None
+        Args:
+            y (mx.array): The current token.
+            prompt_cache (List[Any]): The prompt cache.
+            quantize_cache_fn (Callable[[Any], None]): A function to quantize the cache.
+            total_prompt_tokens (int): The total number of tokens in the prompt.
 
-    def _step(y):
-        with mx.stream(generation_stream):
-            logits = model(y[None], cache=prompt_cache)
-            logits = logits[:, -1, :]
+        Yields:
+            Tuple[mx.array, mx.array]: A token and a vector of log probabilities.
+        """
+        pass
 
-            if logits_processors:
-                nonlocal tokens
-                tokens = mx.concat([tokens, y]) if tokens is not None else y
-
-                for processor in logits_processors:
-                    logits = processor(tokens, logits)
-
-            quantize_cache_fn(prompt_cache)
-
-            logprobs = logits - mx.logsumexp(logits, keepdims=True)
-            y = sampler(logprobs)
-            return y, logprobs.squeeze(0)
-
-    y, logprobs = _step(y)
-
-    mx.async_eval(y, logprobs)
-    n = 0
-    while True:
-        if n != max_tokens:
-            next_y, next_logprobs = _step(y)
-            mx.async_eval(next_y, next_logprobs)
-        if n == 0:
-            mx.eval(y)
-            prompt_progress_callback(total_prompt_tokens, total_prompt_tokens)
-        if n == max_tokens:
-            break
-        yield y.item(), logprobs
-        if n % 256 == 0:
-            mx.clear_cache()
-        y, logprobs = next_y, next_logprobs
-        n += 1
 
 def generate_step(
     prompt: mx.array,
@@ -349,7 +326,7 @@ def generate_step(
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
-    search_strategy: Callable = linear_search
+    search_strategy: Optional[SearchStrategy] = None
 
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
@@ -377,8 +354,8 @@ def generate_step(
            when ``kv_bits`` is non-None. Default: ``0``.
         prompt_progress_callback (Callable[int, int]): A call-back which takes the
            prompt tokens processed so far and the total number of prompt tokens.
-        search_strategy (Callable): A function that returns a generator
-            of tokens and log probabilities, based on the current prompt and cache.
+        search_strategy (SearchStrategy): The search strategy to use. This defaults to
+            `LinearSearch`.
 
     Yields:
         Tuple[mx.array, mx.array]: One token and a vector of log probabilities.
@@ -418,17 +395,82 @@ def generate_step(
             y = y[prefill_step_size:]
             mx.clear_cache()
 
-    return search_strategy(
+
+    if search_strategy is None:
+        search_strategy = LinearSearch(
+            model=model,
+            sampler=sampler,
+            logits_processors=logits_processors,
+            max_tokens=max_tokens,
+            prompt_progress_callback=prompt_progress_callback,
+        )
+
+    return search_strategy.generate(
         y=y,
-        model=model,
-        max_tokens=max_tokens,
-        sampler=sampler,
-        logits_processors=logits_processors,
         prompt_cache=prompt_cache,
-        prompt_progress_callback=prompt_progress_callback,
-        total_prompt_tokens=total_prompt_tokens,
         quantize_cache_fn=quantize_cache_fn,
+        total_prompt_tokens=total_prompt_tokens,
     )
+
+class LinearSearch(SearchStrategy):
+    def __init__(self,
+        model: nn.Module,
+        sampler: Callable[[mx.array], mx.array],
+        logits_processors: List[Callable[[mx.array, mx.array], mx.array]],
+        max_tokens: int,
+        prompt_progress_callback: Callable[[int, int], None],
+    ):
+        self._model = model
+        self._sampler = sampler
+        self._logits_processors = logits_processors
+        self._max_tokens = max_tokens
+        self._prompt_progress_callback = prompt_progress_callback
+    
+    def generate(
+        self,
+        y: mx.array,
+        prompt_cache: List[Any],
+        quantize_cache_fn: Callable[[Any], None],
+        total_prompt_tokens: int,
+    ) -> Generator[Tuple[mx.array, mx.array], None, None]:
+        tokens = None
+
+        def _step(y):
+            with mx.stream(generation_stream):
+                logits = self._model(y[None], cache=prompt_cache)
+                logits = logits[:, -1, :]
+
+                if self._logits_processors:
+                    nonlocal tokens
+                    tokens = mx.concat([tokens, y]) if tokens is not None else y
+
+                    for processor in self._logits_processors:
+                        logits = processor(tokens, logits)
+
+                quantize_cache_fn(prompt_cache)
+
+                logprobs = logits - mx.logsumexp(logits, keepdims=True)
+                y = self._sampler(logprobs)
+                return y, logprobs.squeeze(0)
+
+        y, logprobs = _step(y)
+
+        mx.async_eval(y, logprobs)
+        n = 0
+        while True:
+            if n != self._max_tokens:
+                next_y, next_logprobs = _step(y)
+                mx.async_eval(next_y, next_logprobs)
+            if n == 0:
+                mx.eval(y)
+                self._prompt_progress_callback(total_prompt_tokens, total_prompt_tokens)
+            if n == self._max_tokens:
+                break
+            yield y.item(), logprobs
+            if n % 256 == 0:
+                mx.clear_cache()
+            y, logprobs = next_y, next_logprobs
+            n += 1
 
 def speculative_generate_step(
     prompt: mx.array,
@@ -437,7 +479,7 @@ def speculative_generate_step(
     *,
     num_draft_tokens=2,
     max_tokens: int = 256,
-    sampler: Optional[Callable[mx.array, mx.array]] = None,
+    sampler: Optional[Callable[[mx.array], mx.array]] = None,
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     prompt_cache: Optional[Any] = None,
     prefill_step_size: int = 512,
