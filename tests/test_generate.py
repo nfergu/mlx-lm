@@ -8,12 +8,12 @@ from mlx_lm.generate import (
     generate,
     stream_generate,
 )
+from mlx_lm.search import BeamSearch
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.utils import load
 
 
 class TestGenerate(unittest.TestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
@@ -23,6 +23,19 @@ class TestGenerate(unittest.TestCase):
         # Simple test that generation runs
         text = generate(
             self.model, self.tokenizer, "hello", max_tokens=5, verbose=False
+        )
+
+    def test_generate_with_beam_search(self):
+        # Simple test that generation with beam search runs
+        text = generate(
+            self.model,
+            self.tokenizer,
+            "Hello ",
+            max_tokens=5,
+            verbose=False,
+            search_strategy=BeamSearch(
+                model=self.model, max_sequence_length=5, max_steps=10, beam_width=6
+            ),
         )
 
     def test_generate_with_logit_bias(self):

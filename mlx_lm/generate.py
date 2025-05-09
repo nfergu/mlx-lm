@@ -27,8 +27,6 @@ from .models import cache
 from .models.cache import (
     QuantizedKVCache,
     load_prompt_cache,
-    make_prompt_cache,
-    trim_prompt_cache,
 )
 from .sample_utils import make_sampler
 from .tokenizer_utils import TokenizerWrapper
@@ -284,6 +282,7 @@ def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_
                     group_size=kv_group_size, bits=kv_bits
                 )
 
+
 class SearchStrategy(ABC):
     """
     A strategy for obtaining a sequence of tokens from the model.
@@ -301,7 +300,7 @@ class SearchStrategy(ABC):
         Generates a sequence of tokens from the model.
 
         Args:
-            y (mx.array): The current token.
+            y (mx.array): The next token sequence.
             prompt_cache (List[Any]): The prompt cache.
             quantize_cache_fn (Callable[[Any], None]): A function to quantize the cache.
             total_prompt_tokens (int): The total number of tokens in the prompt.
@@ -326,8 +325,7 @@ def generate_step(
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
-    search_strategy: Optional[SearchStrategy] = None
-
+    search_strategy: Optional[SearchStrategy] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -395,7 +393,6 @@ def generate_step(
             y = y[prefill_step_size:]
             mx.clear_cache()
 
-
     if search_strategy is None:
         search_strategy = LinearSearch(
             model=model,
@@ -412,8 +409,15 @@ def generate_step(
         total_prompt_tokens=total_prompt_tokens,
     )
 
+
 class LinearSearch(SearchStrategy):
-    def __init__(self,
+    """
+    A linear search strategy that generates a sequence of tokens from the model, choosing
+    a single token at each step using the provided `sampler`.
+    """
+
+    def __init__(
+        self,
         model: nn.Module,
         sampler: Callable[[mx.array], mx.array],
         logits_processors: List[Callable[[mx.array, mx.array], mx.array]],
@@ -425,7 +429,7 @@ class LinearSearch(SearchStrategy):
         self._logits_processors = logits_processors
         self._max_tokens = max_tokens
         self._prompt_progress_callback = prompt_progress_callback
-    
+
     def generate(
         self,
         y: mx.array,
@@ -471,6 +475,7 @@ class LinearSearch(SearchStrategy):
                 mx.clear_cache()
             y, logprobs = next_y, next_logprobs
             n += 1
+
 
 def speculative_generate_step(
     prompt: mx.array,
